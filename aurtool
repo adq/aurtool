@@ -22,8 +22,12 @@ import os
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 
 AUR_BASE_URL = "https://aur.archlinux.org"
+AUR_RPC_URL = "https://aur.archlinux.org/rpc/v5"
 STATE_FILE = "aurtool.json"
 PKGS_DIR = "packages"  # cloned AUR repos live here, separate from aurtool's own files
 STATE_VERSION = 1
@@ -45,6 +49,11 @@ def warn(msg: str) -> None:
 def die(msg: str, code: int = 1) -> "NoReturn":  # type: ignore[name-defined]
     print(f"error: {msg}", file=sys.stderr)
     sys.exit(code)
+
+
+def _use_color() -> bool:
+    """True when stdout is an interactive terminal and NO_COLOR is unset."""
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 
 
 # --------------------------------------------------------------------------- #
@@ -260,6 +269,26 @@ def git_diff_range(directory: str, base, head: str = "HEAD") -> str:
     return ""
 
 
+def aur_search(query: str, by: str = "name-desc") -> list:
+    """Query the AUR RPC v5 search endpoint. Returns the list of result dicts.
+
+    Each result has keys like Name, Version, Description, Maintainer (None if
+    orphaned), OutOfDate (epoch int or None), NumVotes, Popularity.
+    """
+    url = f"{AUR_RPC_URL}/search/{urllib.parse.quote(query)}?by={by}"
+    req = urllib.request.Request(url, headers={"User-Agent": "aurtool"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as e:
+        die(f"AUR search failed: {e}")
+    except (json.JSONDecodeError, ValueError) as e:
+        die(f"could not parse AUR response: {e}")
+    if data.get("type") == "error":
+        die(f"AUR error: {data.get('error', 'unknown')}")
+    return data.get("results", [])
+
+
 # --------------------------------------------------------------------------- #
 # Package helpers
 # --------------------------------------------------------------------------- #
@@ -364,6 +393,57 @@ def print_status_table(states: list) -> None:
             info("  ".join("-" * widths[j] for j in range(len(header))))
 
 
+def print_search_results(results: list) -> None:
+    """Render AUR search results, most popular first, flagging risky packages.
+
+    Orphaned packages (no maintainer) are coloured bold red on a TTY and always
+    tagged in the description; out-of-date packages are tagged too.
+    """
+    results = sorted(results, key=lambda r: r.get("Popularity") or 0, reverse=True)
+    header = ("PACKAGE", "VERSION", "VOTES", "DESCRIPTION")
+    rows = [header]
+    flags = [False]  # parallel to rows; True => orphaned (colour the row)
+    orphans = 0
+    for r in results:
+        orphaned = r.get("Maintainer") is None
+        if orphaned:
+            orphans += 1
+        desc = (r.get("Description") or "").strip()
+        tags = []
+        if orphaned:
+            tags.append("orphaned")
+        if r.get("OutOfDate"):
+            tags.append("out of date")
+        if tags:
+            suffix = " (" + ", ".join(tags) + ")"
+            desc = (desc + suffix) if desc else suffix.strip()
+        rows.append((
+            r.get("Name") or "-",
+            r.get("Version") or "-",
+            str(r.get("NumVotes", 0)),
+            desc,
+        ))
+        flags.append(orphaned)
+    # widths exclude the free-running last column so descriptions aren't padded
+    widths = [max(len(row[i]) for row in rows) for i in range(len(header) - 1)]
+    for i, row in enumerate(rows):
+        cells = [row[j].ljust(widths[j]) for j in range(len(header) - 1)]
+        cells.append(row[-1])
+        line = "  ".join(cells).rstrip()
+        if i == 0:
+            info(line)
+            info("  ".join(["-" * w for w in widths] + ["-" * len(header[-1])]))
+        elif flags[i] and _use_color():
+            info(f"\033[1;31m{line}\033[0m")
+        else:
+            info(line)
+    summary = f"{len(results)} result(s)"
+    if orphans:
+        summary += f", {orphans} orphaned"
+    info("")
+    info(summary)
+
+
 # --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
@@ -422,6 +502,18 @@ def cmd_status(args) -> int:
     states = [package_status(pkg, state["packages"][pkg]) for pkg in names]
     print_status_table(states)
     _print_pending_hint(states)
+    return 0
+
+
+def cmd_search(args) -> int:
+    query = args.query
+    if len(query) < 2:
+        die("search query must be at least 2 characters")
+    results = aur_search(query)
+    if not results:
+        info(f"no packages found matching {query!r}")
+        return 0
+    print_search_results(results)
     return 0
 
 
@@ -606,6 +698,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", aliases=["list"], help="show status table (no pull)")
     p_status.add_argument("packages", nargs="*", metavar="PKG")
     p_status.set_defaults(func=cmd_status)
+
+    p_search = sub.add_parser("search", aliases=["find"],
+                              help="search the AUR by name/description (read-only)")
+    p_search.add_argument("query", metavar="QUERY")
+    p_search.set_defaults(func=cmd_search)
 
     p_diff = sub.add_parser("diff", help="show git log + diff since the approved commit")
     p_diff.add_argument("packages", nargs="*", metavar="PKG")

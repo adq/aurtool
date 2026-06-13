@@ -53,6 +53,7 @@ clone's `.SRCINFO`. Nothing derived is cached, so nothing goes stale.
 
 | Command | What it does |
 |---|---|
+| `aurtool search <query>` | Search the AUR (by name + description) and list matches with versions, votes, and descriptions. Read-only; flags **orphaned** (no maintainer) and **out-of-date** packages. Alias: `find`. |
 | `aurtool add <pkg>...` | Clone `https://aur.archlinux.org/<pkg>.git` into `./packages/<pkg>` and manage it. Starts **UNREVIEWED**. |
 | `aurtool update [pkg...]` | `git pull --ff-only` each package, then print the status table. |
 | `aurtool status [pkg...]` | Status table without pulling. |

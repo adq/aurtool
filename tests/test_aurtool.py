@@ -4,7 +4,10 @@ None of these require a live AUR, pacman, or makepkg. Subprocess-backed
 helpers (vercmp) are tested by monkeypatching the runner.
 """
 
+import contextlib
 import importlib.util
+import io
+import json
 import os
 import unittest
 from unittest import mock
@@ -159,6 +162,72 @@ class ReviewLabelTest(unittest.TestCase):
             aurtool.review_label({"present": True, "approved": "x", "reviewed": True}),
             "reviewed",
         )
+
+
+class SearchResultsTest(unittest.TestCase):
+    SAMPLE = [
+        {"Name": "low", "Version": "1-1", "Description": "low pop",
+         "Maintainer": "alice", "NumVotes": 3, "Popularity": 0.5},
+        {"Name": "orphan", "Version": "2-1", "Description": "no maintainer here",
+         "Maintainer": None, "NumVotes": 99, "Popularity": 9.0, "OutOfDate": None},
+        {"Name": "stale", "Version": "3-1", "Description": "needs love",
+         "Maintainer": "bob", "NumVotes": 10, "Popularity": 5.0,
+         "OutOfDate": 1700000000},
+    ]
+
+    def _render(self):
+        # Not a TTY under the test runner, so _use_color() is False and the
+        # output carries no ANSI escapes.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            aurtool.print_search_results(list(self.SAMPLE))
+        return buf.getvalue()
+
+    def test_orphan_tagged(self):
+        out = self._render()
+        orphan_line = next(l for l in out.splitlines() if l.startswith("orphan"))
+        self.assertIn("(orphaned)", orphan_line)
+
+    def test_out_of_date_tagged(self):
+        out = self._render()
+        stale_line = next(l for l in out.splitlines() if l.startswith("stale"))
+        self.assertIn("(out of date)", stale_line)
+
+    def test_sorted_by_popularity_desc(self):
+        out = self._render()
+        names = [l.split()[0] for l in out.splitlines()
+                 if l and l.split()[0] in ("low", "orphan", "stale")]
+        self.assertEqual(names, ["orphan", "stale", "low"])
+
+    def test_summary_counts_orphans(self):
+        out = self._render()
+        self.assertIn("3 result(s), 1 orphaned", out)
+
+    def test_no_ansi_when_not_tty(self):
+        self.assertNotIn("\033[", self._render())
+
+
+class AurSearchTest(unittest.TestCase):
+    @contextlib.contextmanager
+    def _fake_urlopen(self, payload):
+        resp = mock.MagicMock()
+        resp.read.return_value = json.dumps(payload).encode("utf-8")
+        resp.__enter__.return_value = resp
+        with mock.patch.object(aurtool.urllib.request, "urlopen", return_value=resp):
+            yield
+
+    def test_returns_results(self):
+        payload = {"type": "search", "resultcount": 1,
+                   "results": [{"Name": "yay"}]}
+        with self._fake_urlopen(payload):
+            results = aurtool.aur_search("yay")
+        self.assertEqual(results, [{"Name": "yay"}])
+
+    def test_error_type_dies(self):
+        payload = {"type": "error", "error": "too many results"}
+        with self._fake_urlopen(payload):
+            with self.assertRaises(SystemExit):
+                aurtool.aur_search("a")
 
 
 if __name__ == "__main__":
