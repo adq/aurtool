@@ -1,0 +1,652 @@
+#!/usr/bin/env python3
+"""aurtool — a safety-first AUR package manager.
+
+Splits the dangerous one-shot *pull -> build -> install* of tools like yay/paru
+into discrete, human-gated steps. The trust model is a recorded *approved git
+commit* per package: aurtool will never build a package whose current git HEAD
+differs from the commit you explicitly approved after eyeballing the diff.
+
+Operates on the current working directory, git-style:
+
+    ./aurtool.json     state: managed packages + approved commit per package
+    ./<pkgbase>/       git clone of https://aur.archlinux.org/<pkgbase>.git
+
+Standard library only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+AUR_BASE_URL = "https://aur.archlinux.org"
+STATE_FILE = "aurtool.json"
+PKGS_DIR = "packages"  # cloned AUR repos live here, separate from aurtool's own files
+STATE_VERSION = 1
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # git's canonical empty tree
+
+
+# --------------------------------------------------------------------------- #
+# Output helpers
+# --------------------------------------------------------------------------- #
+
+def info(msg: str) -> None:
+    print(msg)
+
+
+def warn(msg: str) -> None:
+    print(f"warning: {msg}", file=sys.stderr)
+
+
+def die(msg: str, code: int = 1) -> "NoReturn":  # type: ignore[name-defined]
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------- #
+# Pure logic (unit-testable without git/pacman/makepkg)
+# --------------------------------------------------------------------------- #
+
+def parse_srcinfo(text: str) -> dict:
+    """Parse .SRCINFO text into a structured dict.
+
+    Returns keys: pkgbase, pkgname (list), epoch, pkgver, pkgrel,
+    depends (list), makedepends (list), and version (the full
+    "[epoch:]pkgver-pkgrel" string, or None if pkgver/pkgrel missing).
+
+    .SRCINFO is a flat "key = value" format. Lines before the first
+    pkgname/pkgbase belong to the pkgbase section; per-pkgname overrides are
+    ignored here since we only need version + dependency edges.
+    """
+    base: dict = {
+        "pkgbase": None,
+        "pkgname": [],
+        "epoch": None,
+        "pkgver": None,
+        "pkgrel": None,
+        "depends": [],
+        "makedepends": [],
+    }
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key == "pkgbase":
+            base["pkgbase"] = value
+        elif key == "pkgname":
+            base["pkgname"].append(value)
+        elif key in ("epoch", "pkgver", "pkgrel"):
+            if base[key] is None:  # take the pkgbase-level (first) value
+                base[key] = value
+        elif key in ("depends", "makedepends"):
+            base[key].append(_dep_name(value))
+
+    if base["pkgbase"] is None and base["pkgname"]:
+        base["pkgbase"] = base["pkgname"][0]
+
+    base["version"] = _compose_version(base["epoch"], base["pkgver"], base["pkgrel"])
+    return base
+
+
+def _dep_name(spec: str) -> str:
+    """Strip a dependency spec down to its bare package name.
+
+    e.g. 'glibc>=2.38', 'foo=1.0', 'bar: optional desc' -> glibc, foo, bar.
+    """
+    for sep in ("<=", ">=", "=", "<", ">", ":"):
+        idx = spec.find(sep)
+        if idx != -1:
+            spec = spec[:idx]
+    return spec.strip()
+
+
+def _compose_version(epoch, pkgver, pkgrel):
+    if not pkgver or not pkgrel:
+        return None
+    ver = f"{pkgver}-{pkgrel}"
+    if epoch:
+        ver = f"{epoch}:{ver}"
+    return ver
+
+
+def build_order(pkgs: list, depmap: dict) -> list:
+    """Topologically order `pkgs` so that managed dependencies build first.
+
+    depmap maps pkgbase -> set/list of pkgbases (within `pkgs`) it depends on.
+    Falls back to stable input order on cycles (caller may warn). Dependencies
+    outside `pkgs` are ignored.
+    """
+    pkgset = list(dict.fromkeys(pkgs))  # de-dupe, preserve order
+    in_set = set(pkgset)
+    visited: set = set()
+    on_stack: set = set()
+    order: list = []
+    had_cycle = [False]
+
+    def visit(p):
+        if p in visited:
+            return
+        if p in on_stack:
+            had_cycle[0] = True
+            return
+        on_stack.add(p)
+        for dep in depmap.get(p, ()):  # build deps first
+            if dep in in_set:
+                visit(dep)
+        on_stack.discard(p)
+        visited.add(p)
+        order.append(p)
+
+    for p in pkgset:
+        visit(p)
+
+    return order, had_cycle[0]
+
+
+# --------------------------------------------------------------------------- #
+# State
+# --------------------------------------------------------------------------- #
+
+def state_path() -> str:
+    return os.path.join(os.getcwd(), STATE_FILE)
+
+
+def load_state() -> dict:
+    path = state_path()
+    if not os.path.exists(path):
+        return {"version": STATE_VERSION, "packages": {}}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        die(f"could not read {STATE_FILE}: {exc}")
+    if not isinstance(data, dict) or "packages" not in data:
+        die(f"{STATE_FILE} is malformed")
+    data.setdefault("version", STATE_VERSION)
+    return data
+
+
+def save_state(state: dict) -> None:
+    path = state_path()
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".aurtool.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+# --------------------------------------------------------------------------- #
+# Subprocess wrappers
+# --------------------------------------------------------------------------- #
+
+def _run(cmd: list, cwd=None, capture=True, check=False):
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        check=check,
+        text=True,
+        capture_output=capture,
+    )
+
+
+def vercmp(a: str, b: str) -> int:
+    """Compare two package versions via pacman's `vercmp`.
+
+    Returns -1 if a<b, 0 if equal, 1 if a>b. vercmp prints the result to
+    stdout (not the exit code).
+    """
+    res = _run(["vercmp", a, b])
+    out = res.stdout.strip()
+    try:
+        n = int(out)
+    except ValueError:
+        die(f"vercmp returned unexpected output: {out!r} {res.stderr.strip()}")
+    return (n > 0) - (n < 0)
+
+
+def installed_version(pkgname: str):
+    """Return the installed version of pkgname, or None if not installed."""
+    res = _run(["pacman", "-Q", pkgname])
+    if res.returncode != 0:
+        return None
+    parts = res.stdout.split()
+    return parts[1] if len(parts) >= 2 else None
+
+
+def git_head(directory: str) -> str:
+    res = _run(["git", "rev-parse", "HEAD"], cwd=directory)
+    if res.returncode != 0:
+        die(f"could not read git HEAD in {directory}: {res.stderr.strip()}")
+    return res.stdout.strip()
+
+
+def git_clone(pkg: str, dest: str) -> None:
+    url = f"{AUR_BASE_URL}/{pkg}.git"
+    res = _run(["git", "clone", url, dest], capture=False)
+    if res.returncode != 0:
+        die(f"git clone failed for {pkg}")
+
+
+def git_pull(directory: str):
+    """Fast-forward pull. Returns (ok, message)."""
+    res = _run(["git", "pull", "--ff-only"], cwd=directory)
+    msg = (res.stdout + res.stderr).strip()
+    return res.returncode == 0, msg
+
+
+def git_log_range(directory: str, base, head: str = "HEAD") -> str:
+    rng = f"{base}..{head}" if base else head
+    res = _run(["git", "log", "--oneline", rng], cwd=directory)
+    return res.stdout.rstrip()
+
+
+def git_diff_range(directory: str, base, head: str = "HEAD") -> str:
+    base = base or EMPTY_TREE
+    res = _run(["git", "diff", base, head], cwd=directory, capture=False)
+    return ""
+
+
+# --------------------------------------------------------------------------- #
+# Package helpers
+# --------------------------------------------------------------------------- #
+
+def read_srcinfo(directory: str):
+    path = os.path.join(directory, ".SRCINFO")
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as fh:
+        return parse_srcinfo(fh.read())
+
+
+def pkg_dir(pkg: str) -> str:
+    return os.path.join(os.getcwd(), PKGS_DIR, pkg)
+
+
+def require_managed(state: dict, names):
+    """Resolve a list of requested names against managed packages.
+
+    Empty `names` means all managed packages (sorted).
+    """
+    managed = state["packages"]
+    if not names:
+        return sorted(managed)
+    unknown = [n for n in names if n not in managed]
+    if unknown:
+        die(f"not managed: {', '.join(unknown)} (use `aurtool add`)")
+    return list(dict.fromkeys(names))
+
+
+# --------------------------------------------------------------------------- #
+# Status model
+# --------------------------------------------------------------------------- #
+
+def package_status(pkg: str, entry: dict) -> dict:
+    """Gather the live status of a single managed package."""
+    directory = pkg_dir(pkg)
+    st = {
+        "pkg": pkg,
+        "present": os.path.isdir(os.path.join(directory, ".git")),
+        "approved": entry.get("approved_commit"),
+        "head": None,
+        "reviewed": False,
+        "available": None,
+        "installed": None,
+        "update": False,
+        "pkgnames": [pkg],
+    }
+    if not st["present"]:
+        return st
+
+    st["head"] = git_head(directory)
+    st["reviewed"] = st["approved"] is not None and st["approved"] == st["head"]
+
+    srcinfo = read_srcinfo(directory)
+    if srcinfo:
+        st["available"] = srcinfo["version"]
+        if srcinfo["pkgname"]:
+            st["pkgnames"] = srcinfo["pkgname"]
+
+    # Installed version: use the first pkgname that is installed.
+    for name in st["pkgnames"]:
+        iv = installed_version(name)
+        if iv is not None:
+            st["installed"] = iv
+            break
+
+    if st["available"]:
+        if st["installed"] is None:
+            st["update"] = True  # not installed yet
+        elif vercmp(st["available"], st["installed"]) > 0:
+            st["update"] = True
+    return st
+
+
+def review_label(st: dict) -> str:
+    if not st["present"]:
+        return "MISSING"
+    if st["approved"] is None:
+        return "UNREVIEWED"
+    if not st["reviewed"]:
+        return "CHANGED"
+    return "reviewed"
+
+
+def print_status_table(states: list) -> None:
+    header = ("PACKAGE", "INSTALLED", "AVAILABLE", "UPDATE", "REVIEW")
+    rows = [header]
+    for st in states:
+        rows.append((
+            st["pkg"],
+            st["installed"] or "-",
+            st["available"] or "-",
+            "yes" if st["update"] else "no",
+            review_label(st),
+        ))
+    widths = [max(len(r[i]) for r in rows) for i in range(len(header))]
+    for i, row in enumerate(rows):
+        line = "  ".join(cell.ljust(widths[j]) for j, cell in enumerate(row))
+        info(line.rstrip())
+        if i == 0:
+            info("  ".join("-" * widths[j] for j in range(len(header))))
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+
+def cmd_add(args) -> int:
+    state = load_state()
+    managed = state["packages"]
+    changed = False
+    for pkg in args.packages:
+        if pkg in managed:
+            warn(f"{pkg}: already managed, skipping")
+            continue
+        dest = pkg_dir(pkg)
+        if os.path.exists(dest):
+            warn(f"{pkg}: directory already exists, skipping")
+            continue
+        os.makedirs(os.path.join(os.getcwd(), PKGS_DIR), exist_ok=True)
+        info(f"cloning {pkg} ...")
+        git_clone(pkg, dest)
+        managed[pkg] = {"approved_commit": None}
+        changed = True
+        info(f"{pkg}: added (UNREVIEWED — run `aurtool diff {pkg}` then `aurtool approve {pkg}`)")
+    if changed:
+        save_state(state)
+    return 0
+
+
+def cmd_update(args) -> int:
+    state = load_state()
+    names = require_managed(state, args.packages)
+    for pkg in names:
+        directory = pkg_dir(pkg)
+        if not os.path.isdir(os.path.join(directory, ".git")):
+            warn(f"{pkg}: directory missing on disk")
+            continue
+        ok, msg = git_pull(directory)
+        if not ok:
+            warn(f"{pkg}: git pull --ff-only failed (upstream rewrite?). Inspect manually:\n{msg}")
+        elif "Already up to date" in msg:
+            info(f"{pkg}: up to date")
+        else:
+            info(f"{pkg}: pulled new commits")
+    info("")
+    states = [package_status(pkg, state["packages"][pkg]) for pkg in names]
+    print_status_table(states)
+    _print_pending_hint(states)
+    return 0
+
+
+def cmd_status(args) -> int:
+    state = load_state()
+    names = require_managed(state, args.packages)
+    if not names:
+        info("no packages managed yet (use `aurtool add <pkg>`)")
+        return 0
+    states = [package_status(pkg, state["packages"][pkg]) for pkg in names]
+    print_status_table(states)
+    _print_pending_hint(states)
+    return 0
+
+
+def _print_pending_hint(states: list) -> None:
+    pending = [st["pkg"] for st in states if st["present"] and not st["reviewed"]]
+    if pending:
+        info("")
+        info(f"unreviewed: {', '.join(pending)}")
+        info("  review with `aurtool diff` then `aurtool approve`")
+
+
+def cmd_diff(args) -> int:
+    state = load_state()
+    names = require_managed(state, args.packages)
+    shown = 0
+    for pkg in names:
+        entry = state["packages"][pkg]
+        directory = pkg_dir(pkg)
+        if not os.path.isdir(os.path.join(directory, ".git")):
+            warn(f"{pkg}: directory missing on disk")
+            continue
+        head = git_head(directory)
+        approved = entry.get("approved_commit")
+        if approved == head and not args.all:
+            continue
+        shown += 1
+        info("=" * 70)
+        if approved is None:
+            info(f"{pkg}: never approved — showing full PKGBUILD/diff")
+        else:
+            info(f"{pkg}: changes since approved commit {approved[:12]}")
+        info("=" * 70)
+        log = git_log_range(directory, approved, head)
+        if log:
+            info(log)
+            info("-" * 70)
+        git_diff_range(directory, approved, head)
+        info("")
+    if shown == 0:
+        info("nothing to review — all selected packages are at their approved commit")
+    return 0
+
+
+def cmd_approve(args) -> int:
+    state = load_state()
+    names = require_managed(state, args.packages)
+    changed = False
+    for pkg in names:
+        entry = state["packages"][pkg]
+        directory = pkg_dir(pkg)
+        if not os.path.isdir(os.path.join(directory, ".git")):
+            warn(f"{pkg}: directory missing on disk, cannot approve")
+            continue
+        head = git_head(directory)
+        if entry.get("approved_commit") == head:
+            info(f"{pkg}: already approved at {head[:12]}")
+            continue
+        if not args.yes:
+            log = git_log_range(directory, entry.get("approved_commit"), head)
+            if log:
+                info(f"{pkg}: commits to approve:")
+                info(log)
+            resp = input(f"approve {pkg} at {head[:12]}? [y/N] ").strip().lower()
+            if resp not in ("y", "yes"):
+                info(f"{pkg}: skipped")
+                continue
+        entry["approved_commit"] = head
+        changed = True
+        info(f"{pkg}: approved at {head[:12]}")
+    if changed:
+        save_state(state)
+    return 0
+
+
+def cmd_build(args) -> int:
+    state = load_state()
+    names = require_managed(state, args.packages)
+
+    states = {pkg: package_status(pkg, state["packages"][pkg]) for pkg in names}
+
+    # Safety gate: refuse anything not at its approved commit.
+    unverified = [
+        pkg for pkg in names
+        if not states[pkg]["present"] or not states[pkg]["reviewed"]
+    ]
+    if unverified:
+        for pkg in unverified:
+            warn(f"{pkg}: {review_label(states[pkg])} — not at approved commit")
+        die(
+            "refusing to build unverified packages. "
+            "Review with `aurtool diff` and approve with `aurtool approve`."
+        )
+
+    # Decide which packages actually need building.
+    to_build = []
+    for pkg in names:
+        st = states[pkg]
+        if args.force or st["update"]:
+            to_build.append(pkg)
+        else:
+            info(f"{pkg}: up to date ({st['installed']}), skipping (use --force to rebuild)")
+
+    if not to_build:
+        info("nothing to build")
+        return 0
+
+    # Order by managed inter-dependencies so AUR deps build first.
+    depmap = {}
+    for pkg in to_build:
+        srcinfo = read_srcinfo(pkg_dir(pkg))
+        deps = set()
+        if srcinfo:
+            for d in srcinfo["depends"] + srcinfo["makedepends"]:
+                if d in to_build and d != pkg:
+                    deps.add(d)
+        depmap[pkg] = deps
+    ordered, had_cycle = build_order(to_build, depmap)
+    if had_cycle:
+        warn("dependency cycle among managed packages; using best-effort order")
+
+    info(f"build order: {', '.join(ordered)}")
+    if args.dry_run:
+        info("dry run — not building")
+        return 0
+
+    makepkg_cmd = ["makepkg", "-si"]
+    if args.noconfirm:
+        makepkg_cmd.append("--noconfirm")
+
+    for pkg in ordered:
+        info("=" * 70)
+        info(f"building {pkg} ...")
+        info("=" * 70)
+        res = subprocess.run(makepkg_cmd, cwd=pkg_dir(pkg))
+        if res.returncode != 0:
+            die(f"{pkg}: makepkg failed (exit {res.returncode}); stopping")
+    info("done")
+    return 0
+
+
+def cmd_remove(args) -> int:
+    state = load_state()
+    names = require_managed(state, args.packages)
+    changed = False
+    for pkg in names:
+        del state["packages"][pkg]
+        changed = True
+        if args.purge:
+            directory = pkg_dir(pkg)
+            if os.path.isdir(directory):
+                import shutil
+                shutil.rmtree(directory)
+                info(f"{pkg}: removed from management and deleted {directory}")
+            else:
+                info(f"{pkg}: removed from management (no directory to delete)")
+        else:
+            info(f"{pkg}: removed from management (directory left in place)")
+    if changed:
+        save_state(state)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="aurtool",
+        description="Safety-first AUR package manager (review before you build).",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_add = sub.add_parser("add", help="clone AUR package(s) into the current dir and manage them")
+    p_add.add_argument("packages", nargs="+", metavar="PKG")
+    p_add.set_defaults(func=cmd_add)
+
+    p_update = sub.add_parser("update", aliases=["sync"], help="git pull all managed packages and show status")
+    p_update.add_argument("packages", nargs="*", metavar="PKG")
+    p_update.set_defaults(func=cmd_update)
+
+    p_status = sub.add_parser("status", aliases=["list"], help="show status table (no pull)")
+    p_status.add_argument("packages", nargs="*", metavar="PKG")
+    p_status.set_defaults(func=cmd_status)
+
+    p_diff = sub.add_parser("diff", help="show git log + diff since the approved commit")
+    p_diff.add_argument("packages", nargs="*", metavar="PKG")
+    p_diff.add_argument("--all", action="store_true", help="show even already-approved packages")
+    p_diff.set_defaults(func=cmd_diff)
+
+    p_approve = sub.add_parser("approve", help="record current HEAD as the approved commit")
+    p_approve.add_argument("packages", nargs="*", metavar="PKG")
+    p_approve.add_argument("-y", "--yes", action="store_true", help="approve without the per-package prompt")
+    p_approve.set_defaults(func=cmd_approve)
+
+    p_build = sub.add_parser("build", aliases=["install"], help="build & install approved packages with makepkg -si")
+    p_build.add_argument("packages", nargs="*", metavar="PKG")
+    p_build.add_argument("--force", action="store_true", help="(re)build even if up to date")
+    p_build.add_argument("--dry-run", action="store_true", help="show build order and stop")
+    p_build.add_argument("--noconfirm", action="store_true", help="pass --noconfirm to makepkg")
+    p_build.set_defaults(func=cmd_build)
+
+    p_remove = sub.add_parser("remove", help="stop managing package(s)")
+    p_remove.add_argument("packages", nargs="+", metavar="PKG")
+    p_remove.add_argument("--purge", action="store_true", help="also delete the cloned directory")
+    p_remove.set_defaults(func=cmd_remove)
+
+    return parser
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        # Downstream pipe (e.g. `| head`) closed early; exit quietly.
+        try:
+            sys.stdout.close()
+        except BrokenPipeError:
+            pass
+        sys.exit(0)

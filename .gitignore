@@ -1,0 +1,7 @@
+# aurtool runtime data — local state and cloned AUR repos are not source.
+/aurtool.json
+.aurtool.*
+/packages/
+
+__pycache__/
+*.pyc
